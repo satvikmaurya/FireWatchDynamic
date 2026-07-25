@@ -1,0 +1,806 @@
+#include <pebble.h>
+
+// Message keys (match messageKeys order in package.json)
+#define MESSAGE_KEY_REQUEST_WEATHER  0
+#define MESSAGE_KEY_TEMPERATURE      1
+#define MESSAGE_KEY_CONDITIONS       2
+
+#define MESSAGE_KEY_SUNRISE 3
+#define MESSAGE_KEY_SUNSET  4
+#define MESSAGE_KEY_TEMP_UNIT  5
+
+// ── Layout ────────────────────────────────────────────────────────────────────
+#define W          200     // screen width
+#define SCENE_H    228     // top ~2/3 of 228px
+#define INFO_Y     131
+#define INFO_H      99
+#define VALLEY_L    72     // left valley edge x
+#define VALLEY_R   128     // right valley edge x
+#define VALLEY_Y   112     // valley floor / lake top y
+#define LAKE_TOP   VALLEY_Y
+#define TIME_W     125   // 60% of 200
+#define STAT_X     128   // TIME_W + 3 (divider gap)
+#define STAT_W      70   // W - STAT_X - 2
+#define STAT_ROW_H   22
+#define STAT_ICON_S  18
+#define STAT_GAP      5
+#define STAT_TOP      5
+
+#define PERSIST_KEY_LAST_HR  1001
+#define PERSIST_KEY_TEMP      1002
+#define PERSIST_KEY_COND      1003
+#define PERSIST_KEY_SUNRISE   1004
+#define PERSIST_KEY_SUNSET    1005
+#define PERSIST_KEY_TEMP_UNIT 1006
+#define PERSIST_KEY_WX_READY  1007
+#define PERSIST_KEY_WMO_CODE 1008
+#define MESSAGE_KEY_TIME_FORMAT  6
+#define PERSIST_KEY_TIME_FORMAT  1009
+static bool s_time_is_12h = false;
+
+static int s_wmo_code = 0;
+
+// ── Weather condition ─────────────────────────────────────────────────────────
+typedef enum {
+  COND_CLEAR, COND_PARTLY, COND_CLOUDY,
+  COND_FOGGY, COND_DRIZZLE, COND_RAIN,
+  COND_SNOW,  COND_STORM
+} WxCond;
+
+static WxCond wmo_to_cond(int c) {
+  if (c == 0)              return COND_CLEAR;
+  if (c <= 2)              return COND_PARTLY;
+  if (c == 3)              return COND_CLOUDY;
+  if (c >= 45 && c <= 48) return COND_FOGGY;
+  if (c >= 51 && c <= 57) return COND_DRIZZLE;
+  if (c >= 61 && c <= 67) return COND_RAIN;
+  if (c >= 71 && c <= 77) return COND_SNOW;
+  if (c >= 80 && c <= 82) return COND_RAIN;
+  if (c >= 85 && c <= 86) return COND_SNOW;
+  if (c >= 95)             return COND_STORM;
+  return COND_CLEAR;
+}
+
+static time_t s_sunrise = 0;
+static time_t s_sunset  = 0;
+
+static void request_weather(void);
+
+static AppTimer *s_weather_startup_timer = NULL;
+
+static void weather_startup_timer_cb(void *data) {
+  request_weather();
+  s_weather_startup_timer = NULL;
+}
+
+static bool s_temp_is_f = false;
+
+// ── State ─────────────────────────────────────────────────────────────────────
+static struct tm s_tm;
+static WxCond   s_cond     = COND_CLEAR;
+static int      s_temp     = 0;
+static bool     s_wx_ready = false;
+static int      s_steps    = 0;
+static int      s_hr       = 0;
+static int      s_bat      = 0;
+static bool     s_charging = false;
+
+// ── UI ────────────────────────────────────────────────────────────────────────
+static Window *s_win;
+static Layer  *s_scene;
+static Layer  *s_info;
+static GFont   s_time_font;
+static GFont   s_date_font;
+static GFont   s_stat_font;
+static GPath  *s_left_path;   // left mountain
+static GPath  *s_right_path;  // right mountain
+static GPath  *s_ridge_path;  // distant ridge visible through valley
+static GBitmap *s_icon_steps_bmp = NULL;
+static GBitmap *s_icon_temp_bmp = NULL;
+static GBitmap *s_icon_heart_bmp = NULL;
+
+// ── Mountain paths (scene-local coords: 200 x 152) ───────────────────────────
+// Left mountain: peak at (44,36), enters valley at (72,112)
+static const GPoint LEFT_PTS[] = {
+  {0,SCENE_H}, {0,80},
+  {10,68}, {22,76}, {32,54}, {44,36},
+  {54,50}, {60,64}, {66,78}, {70,95},
+  {72,VALLEY_Y}, {72,SCENE_H}
+};
+
+// Right mountain: peak at (156,34), enters valley at (128,112)
+static const GPoint RIGHT_PTS[] = {
+  {200,SCENE_H}, {200,78},
+  {190,65}, {178,74}, {168,52}, {156,34},
+  {146,50}, {140,65}, {134,79}, {130,96},
+  {128,VALLEY_Y}, {128,SCENE_H}
+};
+
+// Distant ridge visible through the valley — adds depth
+static const GPoint RIDGE_PTS[] = {
+  {72,SCENE_H}, {72,VALLEY_Y},
+  {82,98}, {92,88}, {100,84},
+  {108,88}, {118,98},
+  {128,VALLEY_Y}, {128,SCENE_H}
+};
+
+// Heart: TimeStyle's 8-pt polygon scaled 25→12 px (freakified/TimeStylePebble, MIT)
+static const GPoint HEART_PTS[] = {
+  {8,17},{15,9},{15,5},{12,2},{8,5},{5,2},{2,5},{2,9}
+};
+// Battery body — 12×12 → 18×18 (×1.5)
+static const GPoint BATT_PTS[] = {
+  {0,5},{2,3},{14,3},{15,5},{15,14},{14,15},{2,15},{0,14}
+};
+static const GPathInfo HEART_INFO = {ARRAY_LENGTH(HEART_PTS), (GPoint*)HEART_PTS};
+static const GPathInfo BATT_INFO  = {ARRAY_LENGTH(BATT_PTS),  (GPoint*)BATT_PTS};
+static GPath *s_heart_path = NULL;
+static GPath *s_batt_path  = NULL;
+
+static const GPathInfo LEFT_PATH_INFO  = {ARRAY_LENGTH(LEFT_PTS),  (GPoint*)LEFT_PTS};
+static const GPathInfo RIGHT_PATH_INFO = {ARRAY_LENGTH(RIGHT_PTS), (GPoint*)RIGHT_PTS};
+static const GPathInfo RIDGE_PATH_INFO = {ARRAY_LENGTH(RIDGE_PTS), (GPoint*)RIDGE_PTS};
+
+// ── Time of day ───────────────────────────────────────────────────────────────
+typedef enum { TOD_NIGHT, TOD_DAWN, TOD_DAY, TOD_DUSK } TOD;
+static TOD get_tod(time_t now) {
+  const int TWILIGHT = 45 * 60;
+
+  if (s_sunrise == 0 || s_sunset == 0) {
+    struct tm *t = localtime(&now);
+    int h = t ? t->tm_hour : 12;
+
+    if (h < 5 || h >= 20) return TOD_NIGHT;
+    if (h < 8)             return TOD_DAWN;
+    if (h < 18)            return TOD_DAY;
+    return TOD_DUSK;
+  }
+
+  if (now < s_sunrise - TWILIGHT) return TOD_NIGHT;
+  if (now < s_sunrise + TWILIGHT) return TOD_DAWN;
+  if (now < s_sunset  - TWILIGHT) return TOD_DAY;
+  if (now < s_sunset  + TWILIGHT) return TOD_DUSK;
+  return TOD_NIGHT;
+}
+
+// ── Sky gradient ──────────────────────────────────────────────────────────────
+// Five horizontal bands (~30px each), painted top to bottom.
+// Mountains are drawn on top, so the lower bands only show through the valley.
+// static void draw_sky_gradient(GContext *ctx, TOD tod) {
+//   GColor b[5];
+//   switch (tod) {
+//     case TOD_NIGHT:
+//       b[0]=GColorBlack;          b[1]=GColorOxfordBlue;
+//       b[2]=GColorOxfordBlue;     b[3]=GColorMidnightGreen;
+//       b[4]=GColorImperialPurple;
+//       break;
+//     case TOD_DAWN:
+//       b[0]=GColorOxfordBlue;     b[1]=GColorIndigo;
+//       b[2]=GColorOrange;         b[3]=GColorChromeYellow;
+//       b[4]=GColorYellow;
+//       break;
+//     case TOD_DUSK:
+//       b[0]=GColorOxfordBlue;     b[1]=GColorDukeBlue;
+//       b[2]=GColorDarkCandyAppleRed; b[3]=GColorOrange;
+//       b[4]=GColorChromeYellow;
+//       break;
+//     case TOD_DAY: default:
+//       if (s_cond == COND_RAIN || s_cond == COND_STORM) {
+//         b[0]=GColorBlack;        b[1]=GColorDarkGray;
+//         b[2]=GColorDarkGray;     b[3]=GColorLightGray;
+//         b[4]=GColorBabyBlueEyes;
+//       } else if (s_cond == COND_CLOUDY || s_cond == COND_FOGGY) {
+//         b[0]=GColorCadetBlue;    b[1]=GColorLightGray;
+//         b[2]=GColorLightGray;    b[3]=GColorBabyBlueEyes;
+//         b[4]=GColorCeleste;
+//       } else {
+//         b[0]=GColorDukeBlue;     b[1]=GColorCobaltBlue;
+//         b[2]=GColorPictonBlue;   b[3]=GColorBabyBlueEyes;
+//         b[4]=GColorCeleste;
+//       }
+//       break;
+//   }
+//   int bh = SCENE_H / 5;
+//   for (int i = 0; i < 5; i++) {
+//     int y = i * bh;
+//     int h = (i == 4) ? (SCENE_H - y) : bh;
+//     graphics_context_set_fill_color(ctx, b[i]);
+//     graphics_fill_rect(ctx, GRect(0, y, W, h), 0, GCornerNone);
+//   }
+// }
+
+// // ── Celestial bodies ──────────────────────────────────────────────────────────
+// static void draw_stars(GContext *ctx) {
+//   graphics_context_set_stroke_color(ctx, GColorWhite);
+//   static const GPoint S[] = {
+//     {10,4},{44,7},{72,3},{100,5},{128,3},{155,7},{182,5},{196,4},
+//     {22,14},{55,17},{80,11},{100,14},{120,11},{145,14},{170,16},{192,13},
+//     {15,23},{50,26},{85,20},{100,23},{115,21},{150,25},{175,22},{195,21},
+//     {30,30},{68,28},{90,32},{110,30},{140,28},{165,31},{185,29}
+//   };
+//   for (size_t i = 0; i < ARRAY_LENGTH(S); i++)
+//     graphics_draw_pixel(ctx, S[i]);
+// }
+
+// // Sun sits upper-right, just above the right mountain peak
+// static void draw_sun(GContext *ctx) {
+//   graphics_context_set_fill_color(ctx, GColorChromeYellow);
+//   graphics_fill_circle(ctx, GPoint(165, 22), 20);
+//   graphics_context_set_fill_color(ctx, GColorYellow);
+//   graphics_fill_circle(ctx, GPoint(165, 22), 15);
+// }
+
+// // Moon is centred over the valley so it reflects in the lake
+// static void draw_moon(GContext *ctx) {
+//   graphics_context_set_fill_color(ctx, GColorWhite);
+//   graphics_fill_circle(ctx, GPoint(100, 25), 13);
+//   graphics_context_set_fill_color(ctx, GColorOxfordBlue); // crescent cutout
+//   graphics_fill_circle(ctx, GPoint(105, 21), 11);
+// }
+
+// // ── Clouds ────────────────────────────────────────────────────────────────────
+// static void draw_cloud(GContext *ctx, int cx, int cy, int r, GColor c) {
+//   graphics_context_set_fill_color(ctx, c);
+//   graphics_fill_circle(ctx, GPoint(cx,   cy),   r);
+//   graphics_fill_circle(ctx, GPoint(cx+r, cy),   r-4);
+//   graphics_fill_circle(ctx, GPoint(cx-r, cy),   r-4);
+//   graphics_fill_circle(ctx, GPoint(cx,   cy+4), r-5);
+// }
+
+// // ── Precipitation ─────────────────────────────────────────────────────────────
+// static void draw_rain(GContext *ctx) {
+//   graphics_context_set_stroke_color(ctx, GColorCobaltBlue);
+//   for (int x = 2; x < W; x += 9)
+//     for (int y = 5; y < SCENE_H; y += 12) {
+//       int jx = (x + y/3) % W;
+//       if (jx > 2 && jx+2 < W && y+5 < SCENE_H)
+//         graphics_draw_line(ctx, GPoint(jx, y), GPoint(jx-2, y+5));
+//     }
+// }
+
+// static void draw_snow(GContext *ctx) {
+//   graphics_context_set_fill_color(ctx, GColorWhite);
+//   static const GPoint F[] = {
+//     {10,8},{35,20},{60,6},{85,25},{108,11},{128,5},{150,18},{172,10},{192,7},
+//     {18,35},{45,40},{75,33},{100,42},{132,37},{158,35},{182,40},
+//     {8,58},{40,52},{70,60},{98,55},{122,63},{150,52},{175,58},
+//     {22,80},{55,75},{88,82},{112,78},{145,82},{168,74}
+//   };
+//   for (size_t i = 0; i < ARRAY_LENGTH(F); i++)
+//     graphics_fill_circle(ctx, F[i], 2);
+// }
+
+// static void draw_lightning(GContext *ctx) {
+//   graphics_context_set_stroke_color(ctx, GColorYellow);
+//   graphics_context_set_stroke_width(ctx, 2);
+//   graphics_draw_line(ctx, GPoint(42,28), GPoint(34,52));
+//   graphics_draw_line(ctx, GPoint(34,52), GPoint(40,52));
+//   graphics_draw_line(ctx, GPoint(40,52), GPoint(30,78));
+// }
+
+// static void draw_fog(GContext *ctx) {
+//   graphics_context_set_fill_color(ctx, GColorLightGray);
+//   for (int y = 20; y < 100; y += 20)
+//     graphics_fill_rect(ctx, GRect(0, y, W, 10), 0, GCornerNone);
+// }
+
+// // ── Trees ─────────────────────────────────────────────────────────────────────
+// // Layered-rectangle conifer. (cx, base_y) = centre of trunk base.
+// static void draw_tree(GContext *ctx, int cx, int base_y, GColor col) {
+//   graphics_context_set_fill_color(ctx, col);
+//   graphics_fill_rect(ctx, GRect(cx,   base_y-5,  2, 5), 0, GCornerNone);
+//   graphics_fill_rect(ctx, GRect(cx-4, base_y-11, 9, 6), 0, GCornerNone);
+//   graphics_fill_rect(ctx, GRect(cx-3, base_y-17, 7, 7), 0, GCornerNone);
+//   graphics_fill_rect(ctx, GRect(cx-2, base_y-23, 5, 7), 0, GCornerNone);
+//   graphics_fill_rect(ctx, GRect(cx-1, base_y-27, 3, 5), 0, GCornerNone);
+// }
+
+// static void draw_trees(GContext *ctx, TOD tod) {
+//   GColor tc = (tod == TOD_NIGHT) ? GColorBlack : GColorDarkGreen;
+//   // Left mountain — inner slope
+//   draw_tree(ctx, 54, 52,  tc);
+//   draw_tree(ctx, 61, 66,  tc);
+//   draw_tree(ctx, 67, 80,  tc);
+//   draw_tree(ctx, 71, 97,  tc);
+//   // Left mountain — outer slope
+//   draw_tree(ctx, 20, 76,  tc);
+//   draw_tree(ctx, 10, 72,  tc);
+//   // Right mountain — inner slope
+//   draw_tree(ctx, 130, 98,  tc);
+//   draw_tree(ctx, 134, 81,  tc);
+//   draw_tree(ctx, 140, 67,  tc);
+//   draw_tree(ctx, 146, 52,  tc);
+//   // Right mountain — outer slope
+//   draw_tree(ctx, 180, 76,  tc);
+//   draw_tree(ctx, 190, 69,  tc);
+// }
+
+// // ── Lake ──────────────────────────────────────────────────────────────────────
+// static GColor lake_col(TOD tod) {
+//   if (tod == TOD_NIGHT) return GColorOxfordBlue;
+//   if (tod == TOD_DAWN)  return GColorChromeYellow;
+//   if (tod == TOD_DUSK)  return GColorDarkCandyAppleRed;
+//   if (s_cond == COND_RAIN || s_cond == COND_STORM) return GColorDarkGray;
+//   if (s_cond == COND_CLOUDY) return GColorCobaltBlue;
+//   return GColorVividCerulean;
+// }
+
+// static void draw_lake(GContext *ctx, TOD tod) {
+//   int lx = VALLEY_L, rx = VALLEY_R;
+//   int ly = VALLEY_Y, lh = SCENE_H - ly;
+
+//   // Base lake fill
+//   graphics_context_set_fill_color(ctx, lake_col(tod));
+//   graphics_fill_rect(ctx, GRect(lx, ly, rx-lx, lh), 0, GCornerNone);
+
+//   // Mountain reflections — dark tapered shapes at each edge, widest at top
+//   GColor rc = (tod == TOD_NIGHT) ? GColorMidnightGreen : GColorDarkGreen;
+//   if (s_cond == COND_RAIN || s_cond == COND_STORM) rc = GColorDarkGray;
+//   graphics_context_set_fill_color(ctx, rc);
+//   for (int row = 0; row < lh; row++) {
+//     int w = 2 + (20 - 2) * (lh - row) / lh; // tapers 20→2 px
+//     int y = ly + row;
+//     graphics_fill_rect(ctx, GRect(lx, y, w, 1), 0, GCornerNone);
+//     graphics_fill_rect(ctx, GRect(rx-w, y, w, 1), 0, GCornerNone);
+//   }
+
+//   // Central highlight — sun or moon column reflected on water
+//   GColor hi = (s_cond <= COND_PARTLY && tod == TOD_DAY) ? GColorYellow : GColorWhite;
+//   if (s_cond > COND_PARTLY && tod != TOD_NIGHT) hi = GColorClear;
+//   graphics_context_set_stroke_color(ctx, hi);
+//   int cx = (lx + rx) / 2;
+//   for (int row = 2; row < lh; row += 5) {
+//     int wd = 2 + (row % 8);
+//     graphics_draw_line(ctx, GPoint(cx-wd/2, ly+row), GPoint(cx+wd/2, ly+row));
+//   }
+
+//   // Scattered shimmer lines
+//   graphics_context_set_stroke_color(ctx, GColorWhite);
+//   for (int y = ly+6; y < SCENE_H; y += 7) {
+//     int x1 = lx + 6 + ((y*7) % 18);
+//     int x2 = x1 + 6 + ((y*3) % 12);
+//     if (x2 < rx - 4)
+//       graphics_draw_line(ctx, GPoint(x1, y), GPoint(x2, y));
+//   }
+// }
+
+// ── Scene layer update proc ───────────────────────────────────────────────────
+static GBitmap *s_scene_bmp  = NULL;
+static uint32_t s_loaded_res = 0xFFFFFFFF;
+
+static uint32_t pick_scene_resource(TOD tod, WxCond cond) {
+  bool is_dawn_dusk = (tod == TOD_DAWN || tod == TOD_DUSK);
+
+  if (is_dawn_dusk) {
+    if (cond == COND_CLEAR || cond == COND_PARTLY) return RESOURCE_ID_SCENE_DAWN_CLEAR;
+    if (cond == COND_SNOW)                         return RESOURCE_ID_SCENE_DUSK_SNOW;
+    if (cond == COND_STORM)                        return RESOURCE_ID_SCENE_DAWN_RAIN;
+    if (cond == COND_CLOUDY || cond == COND_FOGGY) return RESOURCE_ID_SCENE_DAWN_CLEAR;
+    return RESOURCE_ID_SCENE_DAWN_RAIN;
+  }
+
+  if (tod == TOD_NIGHT) {
+    if (cond == COND_CLEAR || cond == COND_PARTLY) return RESOURCE_ID_SCENE_NIGHT_CLEAR;
+    if (cond == COND_SNOW)                         return RESOURCE_ID_SCENE_NIGHT_SNOW;
+    if (cond == COND_STORM)                        return RESOURCE_ID_SCENE_NIGHT_RAIN;
+    if (cond == COND_CLOUDY || cond == COND_FOGGY) return RESOURCE_ID_SCENE_NIGHT_CLOUD;
+    return RESOURCE_ID_SCENE_NIGHT_RAIN;
+  }
+
+  // TOD_DAY
+  if (cond == COND_CLEAR) return RESOURCE_ID_SCENE_DAY_CLEAR;
+  if (cond == COND_PARTLY)                         return RESOURCE_ID_SCENE_DAY_PARTLY;
+  if (cond == COND_SNOW)                         return RESOURCE_ID_SCENE_DAY_SNOW;
+  if (cond == COND_STORM)                        return RESOURCE_ID_SCENE_DAY_STORM;
+  if (cond == COND_CLOUDY || cond == COND_FOGGY) return RESOURCE_ID_SCENE_DAY_CLOUD;
+  return RESOURCE_ID_SCENE_DAY_RAIN;
+}
+
+static void scene_proc(Layer *layer, GContext *ctx) {
+  TOD tod = get_tod(time(NULL));
+  uint32_t res = pick_scene_resource(tod, s_cond);
+  if (res != s_loaded_res) {
+    if (s_scene_bmp) { gbitmap_destroy(s_scene_bmp); s_scene_bmp = NULL; }
+    s_scene_bmp  = gbitmap_create_with_resource(res);
+    s_loaded_res = res;
+  }
+  if (s_scene_bmp)
+    graphics_draw_bitmap_in_rect(ctx, s_scene_bmp, GRect(0, 0, W, SCENE_H));
+}
+
+static void icon_therm(GContext *ctx, int x, int y) {
+  graphics_context_set_fill_color(ctx, GColorWhite);
+  graphics_fill_rect(ctx, GRect(x+6, y,    6, 13), 3, GCornersTop);
+  graphics_context_set_fill_color(ctx, GColorBlack);
+  graphics_fill_rect(ctx, GRect(x+7, y+2,  2,  4), 0, GCornerNone);
+  graphics_context_set_fill_color(ctx, GColorWhite);
+  graphics_fill_rect(ctx, GRect(x+7, y+6,  2,  7), 0, GCornerNone);
+  graphics_fill_circle(ctx, GPoint(x+9, y+14), 4);
+}
+
+static void icon_steps(GContext *ctx, int x, int y) {
+  graphics_context_set_fill_color(ctx, GColorWhite);
+  graphics_fill_rect(ctx, GRect(x,    y+2,  7, 11), 3, GCornersAll);
+  graphics_fill_rect(ctx, GRect(x,    y,    3,  3), 2, GCornersAll);
+  graphics_fill_rect(ctx, GRect(x+3,  y,    3,  3), 2, GCornersAll);
+  graphics_fill_rect(ctx, GRect(x+6,  y,    3,  3), 2, GCornersAll);
+  graphics_fill_rect(ctx, GRect(x+9,  y+6,  7, 11), 3, GCornersAll);
+  graphics_fill_rect(ctx, GRect(x+9,  y+5,  3,  3), 2, GCornersAll);
+  graphics_fill_rect(ctx, GRect(x+12, y+5,  3,  3), 2, GCornersAll);
+  graphics_fill_rect(ctx, GRect(x+15, y+5,  3,  3), 2, GCornersAll);
+}
+
+static void icon_heart(GContext *ctx, int x, int y) {
+  graphics_context_set_fill_color(ctx, GColorWhite);
+  gpath_move_to(s_heart_path, GPoint(x, y - 1));
+  gpath_draw_filled(ctx, s_heart_path);
+}
+
+static void icon_batt(GContext *ctx, int x, int y) {
+  graphics_context_set_fill_color(ctx, GColorWhite);
+  gpath_move_to(s_batt_path, GPoint(x, y));
+  gpath_draw_filled(ctx, s_batt_path);
+  graphics_context_set_fill_color(ctx, GColorBlack);
+  graphics_fill_rect(ctx, GRect(x+2,  y+5, 11, 9), 0, GCornerNone);
+  graphics_context_set_fill_color(ctx, GColorWhite);
+  int fw = (s_bat * 11) / 100;
+  if (fw > 0) graphics_fill_rect(ctx, GRect(x+2, y+5, fw, 9), 0, GCornerNone);
+  graphics_fill_rect(ctx, GRect(x+15, y+7,  3,  5), 0, GCornerNone);
+}
+
+// ── Info bar update proc ──────────────────────────────────────────────────────
+static const char* DAYS[]   = {"Sun","Mon","Tue","Wed","Thu","Fri","Sat"};
+static const char* MONTHS[] = {"Jan","Feb","Mar","Apr","May","Jun",
+                                "Jul","Aug","Sep","Oct","Nov","Dec"};
+
+static void info_proc(Layer *layer, GContext *ctx) {
+
+  // White background
+//   graphics_context_set_fill_color(ctx, GColorWhite);
+//   graphics_fill_rect(ctx, GRect(0, 0, W, INFO_H), 0, GCornerNone);
+
+  // Border around the whole bar
+//   graphics_context_set_stroke_color(ctx, GColorBlack);
+//   graphics_context_set_stroke_width(ctx, 1);
+//   graphics_draw_rect(ctx, GRect(0, 0, W, INFO_H));
+
+  // Vertical divider
+//   graphics_draw_line(ctx, GPoint(TIME_W, 4), GPoint(TIME_W, INFO_H - 4));
+
+  // ── Time (left 60%, vertically centred) ──────────────────────────────────
+//   char t[6];
+//   snprintf(t, sizeof(t), "%02d:%02d", s_tm.tm_hour, s_tm.tm_min);
+  char t[9];
+  if (s_time_is_12h) {
+    int h = s_tm.tm_hour % 12;
+    if (h == 0) h = 12;
+    snprintf(t, sizeof(t), "%d:%02d", h, s_tm.tm_min);
+  } else {
+    snprintf(t, sizeof(t), "%02d:%02d", s_tm.tm_hour, s_tm.tm_min);
+  }
+  graphics_draw_text(ctx, t, s_time_font,
+                     GRect(2, 2, TIME_W - 4, 48),
+                     GTextOverflowModeWordWrap, GTextAlignmentCenter, NULL);
+
+  // Date centred below the time
+  char buf[20];
+  snprintf(buf, sizeof(buf), "%s %d %s",
+           DAYS[s_tm.tm_wday], s_tm.tm_mday, MONTHS[s_tm.tm_mon]);
+  graphics_draw_text(ctx, buf, s_date_font,
+                     GRect(2, 52, TIME_W - 4, 20),
+                     GTextOverflowModeTrailingEllipsis, GTextAlignmentCenter, NULL);
+  
+  // ── Stats (right 40%) ────────────────────────────────────────────────────
+  int sx = STAT_X + 6;
+  int row_w = W - sx - 4;
+  int icon_x = sx;
+  int text_x = icon_x + STAT_ICON_S + STAT_GAP;
+  int text_w = row_w - STAT_ICON_S - STAT_GAP;
+  
+  int row_y;
+  
+  // Temperature
+  row_y = STAT_TOP;
+//   icon_therm(ctx, icon_x, row_y);
+  graphics_context_set_compositing_mode(ctx, GCompOpSet);
+  graphics_draw_bitmap_in_rect(ctx, s_icon_temp_bmp,
+                               GRect(icon_x + 4, row_y + 1, 8, 16));
+  if (s_wx_ready) {
+    int display_temp = s_temp_is_f ? s_temp : (s_temp - 32) * 5 / 9;
+    snprintf(buf, sizeof(buf), "%d\xc2\xb0%s", display_temp, s_temp_is_f ? "F" : "C");
+  } else {
+    snprintf(buf, sizeof(buf), "--\xc2\xb0%s", s_temp_is_f ? "F" : "C");
+  }
+  graphics_draw_text(ctx, buf, s_stat_font,
+                     GRect(text_x, row_y - 3, text_w, STAT_ROW_H),
+                     GTextOverflowModeTrailingEllipsis,
+                     GTextAlignmentLeft, NULL);
+  
+  // Steps
+  row_y = STAT_TOP + STAT_ROW_H;
+  graphics_context_set_compositing_mode(ctx, GCompOpSet);
+  graphics_draw_bitmap_in_rect(ctx, s_icon_steps_bmp,
+                               GRect(icon_x + 2, row_y + 1, 12, 16));
+  if (s_steps >= 1000) snprintf(buf, sizeof(buf), "%d,%03d", s_steps / 1000, s_steps % 1000);
+  else                 snprintf(buf, sizeof(buf), "%d", s_steps);
+  graphics_draw_text(ctx, buf, s_stat_font,
+                     GRect(text_x, row_y - 3, text_w, STAT_ROW_H),
+                     GTextOverflowModeTrailingEllipsis,
+                     GTextAlignmentLeft, NULL);
+  
+  // Heart rate
+  row_y = STAT_TOP + 2 * STAT_ROW_H;
+//   icon_heart(ctx, icon_x, row_y);
+  graphics_context_set_compositing_mode(ctx, GCompOpSet);
+  graphics_draw_bitmap_in_rect(ctx, s_icon_heart_bmp,
+                               GRect(icon_x, row_y + 1, 16, 14));
+  if (s_hr > 0) snprintf(buf, sizeof(buf), "%d", s_hr);
+  else          snprintf(buf, sizeof(buf), "--");
+  graphics_draw_text(ctx, buf, s_stat_font,
+                     GRect(text_x, row_y - 3, text_w, STAT_ROW_H),
+                     GTextOverflowModeTrailingEllipsis,
+                     GTextAlignmentLeft, NULL);
+  
+  // Battery
+  row_y = STAT_TOP + 3 * STAT_ROW_H;
+  icon_batt(ctx, icon_x, row_y);
+  snprintf(buf, sizeof(buf), "%d%%", s_bat);
+  graphics_draw_text(ctx, buf, s_stat_font,
+                     GRect(text_x, row_y - 3, text_w, STAT_ROW_H),
+                     GTextOverflowModeTrailingEllipsis,
+                     GTextAlignmentLeft, NULL);
+}
+
+// ── Service callbacks ─────────────────────────────────────────────────────────
+static void request_weather(void) {
+  DictionaryIterator *iter;
+  if (app_message_outbox_begin(&iter) == APP_MSG_OK) {
+    dict_write_uint8(iter, MESSAGE_KEY_REQUEST_WEATHER, 1);
+    app_message_outbox_send();
+  }
+}
+
+static void tick_handler(struct tm *tick_time, TimeUnits units) {
+  s_tm = *tick_time;
+  if (tick_time->tm_min % 30 == 0) request_weather();
+  layer_mark_dirty(s_scene);
+  layer_mark_dirty(s_info);
+}
+
+static void battery_handler(BatteryChargeState state) {
+  s_bat = state.charge_percent;
+  s_charging = state.is_charging;
+  layer_mark_dirty(s_info);
+}
+
+static void update_heart_rate(void) {
+  time_t now = time(NULL);
+
+  HealthServiceAccessibilityMask m =
+    health_service_metric_accessible(HealthMetricHeartRateBPM,
+                                     now - 60 * 60,
+                                     now);
+
+  if (m & HealthServiceAccessibilityMaskAvailable) {
+    HealthValue v = health_service_peek_current_value(HealthMetricHeartRateBPM);
+
+    if (v > 0) {
+      s_hr = (int)v;
+      persist_write_int(PERSIST_KEY_LAST_HR, s_hr);
+    }
+  }
+
+  layer_mark_dirty(s_info);
+}
+
+static void health_handler(HealthEventType event, void *context) {
+  if (event == HealthEventMovementUpdate || event == HealthEventSignificantUpdate)
+    s_steps = (int)health_service_sum_today(HealthMetricStepCount);
+  if (event == HealthEventHeartRateUpdate) {
+    time_t now = time(NULL);
+    HealthServiceAccessibilityMask m =
+      health_service_metric_accessible(HealthMetricHeartRateBPM, now, now);
+    if (event == HealthEventHeartRateUpdate ||
+        event == HealthEventSignificantUpdate) {
+      update_heart_rate();
+    }
+  }
+  layer_mark_dirty(s_info);
+}
+
+static void force_redraw(void) {
+  if (s_scene) layer_mark_dirty(s_scene);
+  if (s_info) layer_mark_dirty(s_info);
+  if (s_win) {
+    Layer *root = window_get_root_layer(s_win);
+    if (root) layer_mark_dirty(root);
+  }
+}
+
+static void inbox_received(DictionaryIterator *iter, void *context) {
+  Tuple *tt  = dict_find(iter, MESSAGE_KEY_TEMPERATURE);
+  Tuple *tc  = dict_find(iter, MESSAGE_KEY_CONDITIONS);
+  Tuple *tu  = dict_find(iter, MESSAGE_KEY_TEMP_UNIT);
+  Tuple *tsr = dict_find(iter, MESSAGE_KEY_SUNRISE);
+  Tuple *tss = dict_find(iter, MESSAGE_KEY_SUNSET);
+  Tuple *tf = dict_find(iter, MESSAGE_KEY_TIME_FORMAT);
+
+  if (tf) {
+    s_time_is_12h = tf->value->int32 == 1;
+    persist_write_bool(PERSIST_KEY_TIME_FORMAT, s_time_is_12h);
+  }
+
+  if (tt) s_temp = (int)tt->value->int32;
+
+  if (tc) {
+    WxCond old_cond = s_cond;
+  
+    s_wmo_code = (int)tc->value->int32;
+    s_cond = wmo_to_cond(s_wmo_code);
+  
+    APP_LOG(APP_LOG_LEVEL_INFO,
+            "Weather scene update: wmo=%d old_cond=%d new_cond=%d",
+            s_wmo_code, old_cond, s_cond);
+  
+    if (s_cond != old_cond) {
+      s_loaded_res = 0xFFFFFFFF;   // force bitmap reload
+    }
+  }
+  
+  if (tu) {
+    s_temp_is_f = tu->value->int32 == 1;
+    persist_write_bool(PERSIST_KEY_TEMP_UNIT, s_temp_is_f);
+//     request_weather();  // re-fetch in new unit right away
+  }
+
+  if (tsr) s_sunrise = (time_t)tsr->value->int32;
+  if (tss) s_sunset  = (time_t)tss->value->int32;
+
+  if (tt && tc && tsr && tss) {
+    s_wx_ready = true;
+    persist_write_int(PERSIST_KEY_TEMP,      s_temp);
+    persist_write_int(PERSIST_KEY_WMO_CODE,  s_wmo_code);
+    persist_write_int(PERSIST_KEY_SUNRISE,   (int)s_sunrise);
+    persist_write_int(PERSIST_KEY_SUNSET,    (int)s_sunset);
+    persist_write_bool(PERSIST_KEY_WX_READY, true);
+    persist_write_bool(PERSIST_KEY_TEMP_UNIT, s_temp_is_f);
+  }
+
+//   layer_mark_dirty(s_scene);
+//   layer_mark_dirty(s_info);
+  s_loaded_res = 0xFFFFFFFF;  // force scene bitmap reload
+  force_redraw();
+}
+
+// ── Window lifecycle ──────────────────────────────────────────────────────────
+static void win_load(Window *win) {
+  Layer *root = window_get_root_layer(win);
+
+  s_scene = layer_create(GRect(0, 0, W, SCENE_H));
+  layer_set_update_proc(s_scene, scene_proc);
+  layer_add_child(root, s_scene);
+
+  s_info = layer_create(GRect(0, INFO_Y, W, INFO_H));
+  layer_set_update_proc(s_info, info_proc);
+  layer_add_child(root, s_info);
+
+  s_time_font = fonts_get_system_font(FONT_KEY_LECO_38_BOLD_NUMBERS);
+  s_date_font = fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD);
+  s_stat_font = fonts_get_system_font(FONT_KEY_GOTHIC_18);
+
+  s_icon_steps_bmp = gbitmap_create_with_resource(RESOURCE_ID_ICON_STEPS);
+  s_icon_heart_bmp = gbitmap_create_with_resource(RESOURCE_ID_ICON_HEART);
+  s_icon_temp_bmp = gbitmap_create_with_resource(RESOURCE_ID_ICON_TEMP);
+  s_left_path  = gpath_create(&LEFT_PATH_INFO);
+  s_right_path = gpath_create(&RIGHT_PATH_INFO);
+  s_ridge_path = gpath_create(&RIDGE_PATH_INFO);
+  s_heart_path = gpath_create(&HEART_INFO);
+  s_batt_path  = gpath_create(&BATT_INFO);
+}
+
+static void win_unload(Window *win) {
+  if (s_icon_steps_bmp) {
+    gbitmap_destroy(s_icon_steps_bmp);
+    s_icon_steps_bmp = NULL;
+  }
+  if (s_icon_heart_bmp) {
+    gbitmap_destroy(s_icon_heart_bmp);
+    s_icon_heart_bmp = NULL;
+  }
+  if (s_icon_temp_bmp) {
+    gbitmap_destroy(s_icon_temp_bmp);
+    s_icon_temp_bmp = NULL;
+  }
+  gpath_destroy(s_left_path);
+  gpath_destroy(s_right_path);
+  gpath_destroy(s_ridge_path);
+  if (s_scene_bmp) { gbitmap_destroy(s_scene_bmp); s_scene_bmp = NULL; }
+  if (s_heart_path) { gpath_destroy(s_heart_path); s_heart_path = NULL; }
+  if (s_batt_path)  { gpath_destroy(s_batt_path);  s_batt_path  = NULL; }
+  layer_destroy(s_scene);
+  layer_destroy(s_info);
+}
+
+// ── Init / deinit / main ──────────────────────────────────────────────────────
+
+static void restore_persisted_state(void) {
+  if (persist_exists(PERSIST_KEY_WX_READY)) {
+    s_wx_ready = persist_read_bool(PERSIST_KEY_WX_READY);
+  }
+  
+  if (persist_exists(PERSIST_KEY_TIME_FORMAT)) {
+    s_time_is_12h = persist_read_bool(PERSIST_KEY_TIME_FORMAT);
+  }
+
+  if (persist_exists(PERSIST_KEY_TEMP)) {
+    s_temp = persist_read_int(PERSIST_KEY_TEMP);
+  }
+
+  if (persist_exists(PERSIST_KEY_WMO_CODE)) {
+    s_wmo_code = persist_read_int(PERSIST_KEY_WMO_CODE);
+    s_cond = wmo_to_cond(s_wmo_code);
+  }
+
+  if (persist_exists(PERSIST_KEY_SUNRISE)) {
+    s_sunrise = (time_t)persist_read_int(PERSIST_KEY_SUNRISE);
+  }
+
+  if (persist_exists(PERSIST_KEY_SUNSET)) {
+    s_sunset = (time_t)persist_read_int(PERSIST_KEY_SUNSET);
+  }
+
+  if (persist_exists(PERSIST_KEY_TEMP_UNIT)) {
+    s_temp_is_f = persist_read_bool(PERSIST_KEY_TEMP_UNIT);
+  }
+
+  APP_LOG(APP_LOG_LEVEL_INFO,
+          "Restored weather: ready=%d temp=%d wmo=%d cond=%d sunrise=%ld sunset=%ld",
+          s_wx_ready, s_temp, s_wmo_code, s_cond,
+          (long)s_sunrise, (long)s_sunset);
+}
+
+static void init(void) {
+  time_t now = time(NULL);
+  struct tm *t = localtime(&now);
+  if (t) s_tm = *t;
+  
+  restore_persisted_state();
+  
+  s_win = window_create();
+  window_set_background_color(s_win, GColorBlack);
+  window_set_window_handlers(s_win, (WindowHandlers){
+    .load = win_load,
+    .unload = win_unload
+  });
+
+  window_stack_push(s_win, true);
+
+  tick_timer_service_subscribe(MINUTE_UNIT, tick_handler);
+
+  battery_state_service_subscribe(battery_handler);
+  BatteryChargeState bs = battery_state_service_peek();
+  s_bat = bs.charge_percent;
+  s_charging = bs.is_charging;
+
+  health_service_events_subscribe(health_handler, NULL);
+  s_steps = (int)health_service_sum_today(HealthMetricStepCount);
+  update_heart_rate();
+
+  app_message_register_inbox_received(inbox_received);
+  app_message_open(512, 512);
+
+  s_weather_startup_timer = app_timer_register(1500, weather_startup_timer_cb, NULL);
+}
+
+static void deinit(void) {
+  health_service_events_unsubscribe();
+  tick_timer_service_unsubscribe();
+  battery_state_service_unsubscribe();
+  window_destroy(s_win);
+}
+
+int main(void) {
+  init();
+  app_event_loop();
+  deinit();
+}
