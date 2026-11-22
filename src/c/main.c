@@ -34,9 +34,7 @@
 #define PERSIST_KEY_TEMP_UNIT 1006
 #define PERSIST_KEY_WX_READY  1007
 #define PERSIST_KEY_WMO_CODE 1008
-#define MESSAGE_KEY_TIME_FORMAT  6
-#define PERSIST_KEY_TIME_FORMAT  1009
-static bool s_time_is_12h = false;
+#define PERSIST_KEY_TIME_FORMAT  1009  // no longer used: 12/24h comes from clock_is_24h_style()
 
 static int s_wmo_code = 0;
 
@@ -471,7 +469,7 @@ static void info_proc(Layer *layer, GContext *ctx) {
 //   char t[6];
 //   snprintf(t, sizeof(t), "%02d:%02d", s_tm.tm_hour, s_tm.tm_min);
   char t[9];
-  if (s_time_is_12h) {
+  if (!clock_is_24h_style()) {  // the watch's own 12/24h setting
     int h = s_tm.tm_hour % 12;
     if (h == 0) h = 12;
     snprintf(t, sizeof(t), "%d:%02d", h, s_tm.tm_min);
@@ -506,7 +504,8 @@ static void info_proc(Layer *layer, GContext *ctx) {
   graphics_draw_bitmap_in_rect(ctx, s_icon_temp_bmp,
                                GRect(icon_x + 4, row_y + 1, 8, 16));
   if (s_wx_ready) {
-    int display_temp = s_temp_is_f ? s_temp : (s_temp - 32) * 5 / 9;
+    int c10 = (s_temp - 32) * 5;  // round, rather than truncate, when converting to °C
+    int display_temp = s_temp_is_f ? s_temp : (c10 >= 0 ? c10 + 4 : c10 - 4) / 9;
     snprintf(buf, sizeof(buf), "%d\xc2\xb0%s", display_temp, s_temp_is_f ? "F" : "C");
   } else {
     snprintf(buf, sizeof(buf), "--\xc2\xb0%s", s_temp_is_f ? "F" : "C");
@@ -623,12 +622,6 @@ static void inbox_received(DictionaryIterator *iter, void *context) {
   Tuple *tu  = dict_find(iter, MESSAGE_KEY_TEMP_UNIT);
   Tuple *tsr = dict_find(iter, MESSAGE_KEY_SUNRISE);
   Tuple *tss = dict_find(iter, MESSAGE_KEY_SUNSET);
-  Tuple *tf = dict_find(iter, MESSAGE_KEY_TIME_FORMAT);
-
-  if (tf) {
-    s_time_is_12h = tf->value->int32 == 1;
-    persist_write_bool(PERSIST_KEY_TIME_FORMAT, s_time_is_12h);
-  }
 
   if (tt) s_temp = (int)tt->value->int32;
 
@@ -728,9 +721,7 @@ static void restore_persisted_state(void) {
     s_wx_ready = persist_read_bool(PERSIST_KEY_WX_READY);
   }
   
-  if (persist_exists(PERSIST_KEY_TIME_FORMAT)) {
-    s_time_is_12h = persist_read_bool(PERSIST_KEY_TIME_FORMAT);
-  }
+  persist_delete(PERSIST_KEY_TIME_FORMAT);  // stale value from the old settings page
 
   if (persist_exists(PERSIST_KEY_TEMP)) {
     s_temp = persist_read_int(PERSIST_KEY_TEMP);
