@@ -1,16 +1,11 @@
 {
     "author": "FirstPebble",
-    "dependencies": {
-        "@rebble/clay": "^1.0.10"
-    },
     "keywords": [
         "pebble-app"
     ],
     "name": "firewatch",
     "pebble": {
         "capabilities": [
-            "location",
-            "configurable",
             "health"
         ],
         "displayName": "FireWatch Dynamic",
@@ -21,12 +16,7 @@
             "CONDITIONS",
             "SUNRISE",
             "SUNSET",
-            "TEMP_UNIT",
-            "TIME_FORMAT",
-            "WEATHER_PROVIDER",
-            "OWM_API_KEY",
-            "WEATHERAPI_KEY",
-            "CUSTOM_LOCATION"
+            "TEMP_UNIT"
         ],
         "projectType": "native",
         "resources": {
@@ -207,6 +197,13 @@
         "sdkVersion": "3",
         "targetPlatforms": [
             "emery"
+        ],
+        "usesPermissions": [
+            {
+                "name": "Location",
+                "reason": "To show the weather for your weather locations in the Pebble app",
+                "required": false
+            }
         ],
         "uuid": "0de960fa-1ad2-4fa7-af23-b50442caf56a",
         "watchapp": {
